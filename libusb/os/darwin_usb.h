@@ -200,4 +200,19 @@ struct darwin_transfer_priv {
   UInt32 size;
 };
 
+
+/// Attempt to acquire exclusive USB access for the desired devices.
+///
+/// This function must be called within a process with root priviledge.
+///
+/// Assertions for exclusive access are maintained internally. This method only needs to be called one time. Subsequent calls will
+/// have no effect. So, the USB devices must be attached at the time the emulator is launched.
+///
+/// Currently the devices are specified at the command line. Multiple devices can be specified at the command line. For each such
+/// device, specify the `-device` switch followed by the device's specification prefixed by `usb-host` and including the required vendor
+/// and product ids along with any other optional properties. Properties are comma delimitted and specified as key/value pair
+/// assignments with the `=` delimitter. For example:
+/// `-device usb-host,bus=ehci.0,vendorid=0x0b05,productid=0x17cb`
+void DarwinGetExclusiveAccessForDevices(void);
+
 #endif
