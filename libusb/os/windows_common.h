@@ -47,7 +47,7 @@
 #define ULONG_CAST(x)	((unsigned long)(x))
 #endif
 
-#if defined(__CYGWIN__ )
+#if defined(__CYGWIN__)
 #define _stricmp strcasecmp
 #define _strdup strdup
 // _beginthreadex is MSVCRT => unavailable for cygwin. Fallback to using CreateThread
@@ -60,29 +60,29 @@
  * API macros - leveraged from libusb-win32 1.x
  */
 #define DLL_STRINGIFY(s) #s
-#define DLL_LOAD_LIBRARY(name) LoadLibraryA(DLL_STRINGIFY(name))
 
 /*
  * Macros for handling DLL themselves
  */
 #define DLL_HANDLE_NAME(name) __dll_##name##_handle
 
-#define DLL_DECLARE_HANDLE(name)				\
+#define DLL_DECLARE_HANDLE(name)					\
 	static HMODULE DLL_HANDLE_NAME(name)
 
-#define DLL_GET_HANDLE(name)					\
-	do {							\
-		DLL_HANDLE_NAME(name) = DLL_LOAD_LIBRARY(name);	\
-		if (!DLL_HANDLE_NAME(name))			\
-			return false;				\
+#define DLL_GET_HANDLE(ctx, name)					\
+	do {								\
+		DLL_HANDLE_NAME(name) = load_system_library(ctx,	\
+				DLL_STRINGIFY(name));			\
+		if (!DLL_HANDLE_NAME(name))				\
+			return false;					\
 	} while (0)
 
-#define DLL_FREE_HANDLE(name)					\
-	do {							\
-		if (DLL_HANDLE_NAME(name)) {			\
-			FreeLibrary(DLL_HANDLE_NAME(name));	\
-			DLL_HANDLE_NAME(name) = NULL;		\
-		}						\
+#define DLL_FREE_HANDLE(name)						\
+	do {								\
+		if (DLL_HANDLE_NAME(name)) {				\
+			FreeLibrary(DLL_HANDLE_NAME(name));		\
+			DLL_HANDLE_NAME(name) = NULL;			\
+		}							\
 	} while (0)
 
 /*
@@ -327,6 +327,8 @@ struct windows_backend {
 
 struct windows_context_priv {
 	const struct windows_backend *backend;
+	HANDLE completion_port;
+	HANDLE completion_port_thread;
 };
 
 union windows_device_priv {
@@ -340,7 +342,7 @@ union windows_device_handle_priv {
 };
 
 struct windows_transfer_priv {
-	struct winfd pollable_fd;
+	OVERLAPPED overlapped;
 	HANDLE handle;
 	union {
 		struct usbdk_transfer_priv usbdk_priv;
@@ -351,7 +353,7 @@ struct windows_transfer_priv {
 static inline OVERLAPPED *get_transfer_priv_overlapped(struct usbi_transfer *itransfer)
 {
 	struct windows_transfer_priv *transfer_priv = usbi_get_transfer_priv(itransfer);
-	return transfer_priv->pollable_fd.overlapped;
+	return &transfer_priv->overlapped;
 }
 
 static inline void set_transfer_priv_handle(struct usbi_transfer *itransfer, HANDLE handle)
@@ -375,9 +377,10 @@ static inline struct winusb_transfer_priv *get_winusb_transfer_priv(struct usbi_
 extern const struct windows_backend usbdk_backend;
 extern const struct windows_backend winusb_backend;
 
+HMODULE load_system_library(struct libusb_context *ctx, const char *name);
 unsigned long htab_hash(const char *str);
 enum libusb_transfer_status usbd_status_to_libusb_transfer_status(USBD_STATUS status);
-void windows_force_sync_completion(OVERLAPPED *overlapped, ULONG size);
+void windows_force_sync_completion(struct usbi_transfer *itransfer, ULONG size);
 
 #if defined(ENABLE_LOGGING)
 const char *windows_error_str(DWORD error_code);

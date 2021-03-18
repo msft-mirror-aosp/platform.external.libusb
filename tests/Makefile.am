@@ -4,4 +4,4 @@ LIBS =
 
 noinst_PROGRAMS = stress
 
-stress_SOURCES = stress.c libusb_testlib.h testlib.c
+stress_SOURCES = stress.c libusb_testlib.h testlib.c config.h
