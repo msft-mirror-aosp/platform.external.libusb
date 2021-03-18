@@ -28,11 +28,9 @@
 #include <windows.h>
 #include <setupapi.h>
 #include <ctype.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <process.h>
 #include <stdio.h>
-#include <inttypes.h>
 #include <objbase.h>
 #include <winioctl.h>
 
@@ -148,21 +146,21 @@ static char *normalize_path(const char *path)
 /*
  * Cfgmgr32, AdvAPI32, OLE32 and SetupAPI DLL functions
  */
-static bool init_dlls(void)
+static bool init_dlls(struct libusb_context *ctx)
 {
-	DLL_GET_HANDLE(Cfgmgr32);
+	DLL_GET_HANDLE(ctx, Cfgmgr32);
 	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Parent, true);
 	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Child, true);
 
 	// Prefixed to avoid conflict with header files
-	DLL_GET_HANDLE(AdvAPI32);
+	DLL_GET_HANDLE(ctx, AdvAPI32);
 	DLL_LOAD_FUNC_PREFIXED(AdvAPI32, p, RegQueryValueExW, true);
 	DLL_LOAD_FUNC_PREFIXED(AdvAPI32, p, RegCloseKey, true);
 
-	DLL_GET_HANDLE(OLE32);
+	DLL_GET_HANDLE(ctx, OLE32);
 	DLL_LOAD_FUNC_PREFIXED(OLE32, p, IIDFromString, true);
 
-	DLL_GET_HANDLE(SetupAPI);
+	DLL_GET_HANDLE(ctx, SetupAPI);
 	DLL_LOAD_FUNC_PREFIXED(SetupAPI, p, SetupDiGetClassDevsA, true);
 	DLL_LOAD_FUNC_PREFIXED(SetupAPI, p, SetupDiEnumDeviceInfo, true);
 	DLL_LOAD_FUNC_PREFIXED(SetupAPI, p, SetupDiEnumDeviceInterfaces, true);
@@ -465,6 +463,28 @@ static int get_interface_by_endpoint(struct libusb_config_descriptor *conf_desc,
 }
 
 /*
+ * Open a device and associate the HANDLE with the context's I/O completion port
+ */
+static HANDLE windows_open(struct libusb_device *dev, const char *path, DWORD access)
+{
+	struct libusb_context *ctx = DEVICE_CTX(dev);
+	struct windows_context_priv *priv = usbi_get_context_priv(ctx);
+	HANDLE handle;
+
+	handle = CreateFileA(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+	if (handle == INVALID_HANDLE_VALUE)
+		return handle;
+
+	if (CreateIoCompletionPort(handle, priv->completion_port, 0, 0) == NULL) {
+		usbi_err(ctx, "failed to associate handle to I/O completion port: %s", windows_error_str(0));
+		CloseHandle(handle);
+		return INVALID_HANDLE_VALUE;
+	}
+
+	return handle;
+}
+
+/*
  * Populate the endpoints addresses of the device_priv interface helper structs
  */
 static int windows_assign_endpoints(struct libusb_device_handle *dev_handle, uint8_t iface, uint8_t altsetting)
@@ -623,7 +643,7 @@ static int winusb_init(struct libusb_context *ctx)
 	int i;
 
 	// Load DLL imports
-	if (!init_dlls()) {
+	if (!init_dlls(ctx)) {
 		usbi_err(ctx, "could not resolve DLL functions");
 		return LIBUSB_ERROR_OTHER;
 	}
@@ -758,6 +778,243 @@ static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handl
 	}
 }
 
+#define ROOT_HUB_FS_CONFIG_DESC_LENGTH		0x19
+#define ROOT_HUB_HS_CONFIG_DESC_LENGTH		0x19
+#define ROOT_HUB_SS_CONFIG_DESC_LENGTH		0x1f
+#define CONFIG_DESC_WTOTAL_LENGTH_OFFSET	0x02
+#define CONFIG_DESC_EP_MAX_PACKET_OFFSET	0x16
+#define CONFIG_DESC_EP_BINTERVAL_OFFSET		0x18
+
+static const uint8_t root_hub_config_descriptor_template[] = {
+	// Configuration Descriptor
+	LIBUSB_DT_CONFIG_SIZE,		// bLength
+	LIBUSB_DT_CONFIG,		// bDescriptorType
+	0x00, 0x00,			// wTotalLength (filled in)
+	0x01,				// bNumInterfaces
+	0x01,				// bConfigurationValue
+	0x00,				// iConfiguration
+	0xc0,				// bmAttributes (reserved + self-powered)
+	0x00,				// bMaxPower
+	// Interface Descriptor
+	LIBUSB_DT_INTERFACE_SIZE,	// bLength
+	LIBUSB_DT_INTERFACE,		// bDescriptorType
+	0x00,				// bInterfaceNumber
+	0x00,				// bAlternateSetting
+	0x01,				// bNumEndpoints
+	LIBUSB_CLASS_HUB,		// bInterfaceClass
+	0x00,				// bInterfaceSubClass
+	0x00,				// bInterfaceProtocol
+	0x00,				// iInterface
+	// Endpoint Descriptor
+	LIBUSB_DT_ENDPOINT_SIZE,	// bLength
+	LIBUSB_DT_ENDPOINT,		// bDescriptorType
+	0x81,				// bEndpointAddress
+	0x03,				// bmAttributes (Interrupt)
+	0x00, 0x00,			// wMaxPacketSize (filled in)
+	0x00,				// bInterval (filled in)
+	// SuperSpeed Endpoint Companion Descriptor
+	LIBUSB_DT_SS_ENDPOINT_COMPANION_SIZE,	// bLength
+	LIBUSB_DT_SS_ENDPOINT_COMPANION,	// bDescriptorType
+	0x00,					// bMaxBurst
+	0x00,					// bmAttributes
+	0x02, 0x00				// wBytesPerInterval
+};
+
+static int alloc_root_hub_config_desc(struct libusb_device *dev, ULONG num_ports,
+	uint8_t config_desc_length, uint8_t ep_interval)
+{
+	struct winusb_device_priv *priv = usbi_get_device_priv(dev);
+	uint8_t *ptr;
+
+	priv->config_descriptor = malloc(sizeof(*priv->config_descriptor));
+	if (priv->config_descriptor == NULL)
+		return LIBUSB_ERROR_NO_MEM;
+
+	// Most config descriptors come from cache_config_descriptors() which obtains the
+	// descriptors from the hub using an allocated USB_DESCRIPTOR_REQUEST structure.
+	// To avoid an extra malloc + memcpy we just hold on to the USB_DESCRIPTOR_REQUEST
+	// structure we already have and back up the pointer in windows_device_priv_release()
+	// when freeing the descriptors. To keep a single execution path, we need to offset
+	// the pointer here by the same amount.
+	ptr = malloc(USB_DESCRIPTOR_REQUEST_SIZE + config_desc_length);
+	if (ptr == NULL)
+		return LIBUSB_ERROR_NO_MEM;
+
+	ptr += USB_DESCRIPTOR_REQUEST_SIZE;
+
+	memcpy(ptr, root_hub_config_descriptor_template, config_desc_length);
+	ptr[CONFIG_DESC_WTOTAL_LENGTH_OFFSET] = config_desc_length;
+	ptr[CONFIG_DESC_EP_MAX_PACKET_OFFSET] = (uint8_t)((num_ports + 7) / 8);
+	ptr[CONFIG_DESC_EP_BINTERVAL_OFFSET] = ep_interval;
+
+	priv->config_descriptor[0] = (PUSB_CONFIGURATION_DESCRIPTOR)ptr;
+	priv->active_config = 1;
+
+	return 0;
+}
+
+static int init_root_hub(struct libusb_device *dev)
+{
+	struct libusb_context *ctx = DEVICE_CTX(dev);
+	struct winusb_device_priv *priv = usbi_get_device_priv(dev);
+	USB_NODE_CONNECTION_INFORMATION_EX conn_info;
+	USB_NODE_CONNECTION_INFORMATION_EX_V2 conn_info_v2;
+	USB_NODE_INFORMATION hub_info;
+	enum libusb_speed speed = LIBUSB_SPEED_UNKNOWN;
+	uint8_t config_desc_length;
+	uint8_t ep_interval;
+	HANDLE handle;
+	ULONG port_number, num_ports;
+	DWORD size;
+	int r;
+
+	// Determining the speed of a root hub is painful. Microsoft does not directly report the speed
+	// capabilities of the root hub itself, only its ports and/or connected devices. Therefore we
+	// are forced to query each individual port of the root hub to try and infer the root hub's
+	// speed. Note that we have to query all ports because the presence of a device on that port
+	// changes if/how Windows returns any useful speed information.
+	handle = CreateFileA(priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	if (handle == INVALID_HANDLE_VALUE) {
+		usbi_err(ctx, "could not open root hub %s: %s", priv->path, windows_error_str(0));
+		return LIBUSB_ERROR_ACCESS;
+	}
+
+	if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_INFORMATION, NULL, 0, &hub_info, sizeof(hub_info), &size, NULL)) {
+		usbi_warn(ctx, "could not get root hub info for '%s': %s", priv->dev_id, windows_error_str(0));
+		CloseHandle(handle);
+		return LIBUSB_ERROR_ACCESS;
+	}
+
+	num_ports = hub_info.u.HubInformation.HubDescriptor.bNumberOfPorts;
+	usbi_dbg("root hub '%s' reports %lu ports", priv->dev_id, ULONG_CAST(num_ports));
+
+	if (windows_version >= WINDOWS_8) {
+		// Windows 8 and later is better at reporting the speed capabilities of the root hub,
+		// but it is not perfect. If no device is attached to the port being queried, the
+		// returned information will only indicate whether that port supports USB 3.0 signalling.
+		// That is not enough information to distinguish between SuperSpeed and SuperSpeed Plus.
+		for (port_number = 1; port_number <= num_ports; port_number++) {
+			conn_info_v2.ConnectionIndex = port_number;
+			conn_info_v2.Length = sizeof(conn_info_v2);
+			conn_info_v2.SupportedUsbProtocols.Usb300 = 1;
+			if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2,
+				&conn_info_v2, sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, NULL)) {
+				usbi_warn(ctx, "could not get node connection information (V2) for root hub '%s' port %lu: %s",
+					priv->dev_id, ULONG_CAST(port_number), windows_error_str(0));
+				break;
+			}
+
+			if (conn_info_v2.Flags.DeviceIsSuperSpeedPlusCapableOrHigher)
+				speed = MAX(speed, LIBUSB_SPEED_SUPER_PLUS);
+			else if (conn_info_v2.Flags.DeviceIsSuperSpeedCapableOrHigher || conn_info_v2.SupportedUsbProtocols.Usb300)
+				speed = MAX(speed, LIBUSB_SPEED_SUPER);
+			else if (conn_info_v2.SupportedUsbProtocols.Usb200)
+				speed = MAX(speed, LIBUSB_SPEED_HIGH);
+			else
+				speed = MAX(speed, LIBUSB_SPEED_FULL);
+		}
+
+		if (speed != LIBUSB_SPEED_UNKNOWN)
+			goto make_descriptors;
+	}
+
+	// At this point the speed is still not known, most likely because we are executing on
+	// Windows 7 or earlier. The following hackery peeks into the root hub's Device ID and
+	// tries to extract speed information from it, based on observed naming conventions.
+	// If this does not work, we will query individual ports of the root hub.
+	if (strstr(priv->dev_id, "ROOT_HUB31") != NULL)
+		speed = LIBUSB_SPEED_SUPER_PLUS;
+	else if (strstr(priv->dev_id, "ROOT_HUB30") != NULL)
+		speed = LIBUSB_SPEED_SUPER;
+	else if (strstr(priv->dev_id, "ROOT_HUB20") != NULL)
+		speed = LIBUSB_SPEED_HIGH;
+
+	if (speed != LIBUSB_SPEED_UNKNOWN)
+		goto make_descriptors;
+
+	// Windows only reports speed information about a connected device. This means that a root
+	// hub with no connected devices or devices that are all operating at a speed less than the
+	// highest speed that the root hub supports will not give us the correct speed.
+	for (port_number = 1; port_number <= num_ports; port_number++) {
+		conn_info.ConnectionIndex = port_number;
+		if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, sizeof(conn_info),
+			&conn_info, sizeof(conn_info), &size, NULL)) {
+			usbi_warn(ctx, "could not get node connection information for root hub '%s' port %lu: %s",
+				priv->dev_id, ULONG_CAST(port_number), windows_error_str(0));
+			continue;
+		}
+
+		if (conn_info.ConnectionStatus != DeviceConnected)
+			continue;
+
+		if (conn_info.Speed == UsbHighSpeed) {
+			speed = LIBUSB_SPEED_HIGH;
+			break;
+		}
+	}
+
+make_descriptors:
+	CloseHandle(handle);
+
+	dev->device_descriptor.bLength = LIBUSB_DT_DEVICE_SIZE;
+	dev->device_descriptor.bDescriptorType = LIBUSB_DT_DEVICE;
+	dev->device_descriptor.bDeviceClass = LIBUSB_CLASS_HUB;
+	if ((dev->device_descriptor.idVendor == 0) && (dev->device_descriptor.idProduct == 0)) {
+		dev->device_descriptor.idVendor = 0x1d6b;	// Linux Foundation
+		dev->device_descriptor.idProduct = (uint16_t)speed;
+	}
+	dev->device_descriptor.bcdDevice = 0x0100;
+	dev->device_descriptor.bNumConfigurations = 1;
+
+	switch (speed) {
+	case LIBUSB_SPEED_SUPER_PLUS:
+		dev->device_descriptor.bcdUSB = 0x0310;
+		config_desc_length = ROOT_HUB_SS_CONFIG_DESC_LENGTH;
+		ep_interval = 0x0c;	// 256ms
+		break;
+	case LIBUSB_SPEED_SUPER:
+		dev->device_descriptor.bcdUSB = 0x0300;
+		config_desc_length = ROOT_HUB_SS_CONFIG_DESC_LENGTH;
+		ep_interval = 0x0c;	// 256ms
+		break;
+	case LIBUSB_SPEED_HIGH:
+		dev->device_descriptor.bcdUSB = 0x0200;
+		config_desc_length = ROOT_HUB_HS_CONFIG_DESC_LENGTH;
+		ep_interval = 0x0c;	// 256ms
+		break;
+	case LIBUSB_SPEED_LOW:		// Not used, but keeps compiler happy
+	case LIBUSB_SPEED_UNKNOWN:
+		// This case means absolutely no information about this root hub was determined.
+		// There is not much choice than to be pessimistic and label this as a
+		// full-speed device.
+		speed = LIBUSB_SPEED_FULL;
+		// fallthrough
+	case LIBUSB_SPEED_FULL:
+		dev->device_descriptor.bcdUSB = 0x0110;
+		config_desc_length = ROOT_HUB_FS_CONFIG_DESC_LENGTH;
+		ep_interval = 0xff;	// 255ms
+		break;
+	default:			// Impossible, buts keeps compiler happy
+		usbi_err(ctx, "program assertion failed - unknown root hub speed");
+		return LIBUSB_ERROR_INVALID_PARAM;
+	}
+
+	if (speed >= LIBUSB_SPEED_SUPER) {
+		dev->device_descriptor.bDeviceProtocol = 0x03;	// USB 3.0 Hub
+		dev->device_descriptor.bMaxPacketSize0 = 0x09;	// 2^9 bytes
+	} else {
+		dev->device_descriptor.bMaxPacketSize0 = 0x40;	// 64 bytes
+	}
+
+	dev->speed = speed;
+
+	r = alloc_root_hub_config_desc(dev, num_ports, config_desc_length, ep_interval);
+	if (r)
+		usbi_err(ctx, "could not allocate config descriptor for root hub '%s'", priv->dev_id);
+
+	return r;
+}
+
 /*
  * Populate a libusb device structure
  */
@@ -801,6 +1058,10 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 
 			for (depth = 1; bus_number == 0; depth++) {
 				tmp_dev = get_ancestor(ctx, devinst, &devinst);
+				if (tmp_dev == NULL) {
+					usbi_warn(ctx, "ancestor for device '%s' not found at depth %u", priv->dev_id, depth);
+					return LIBUSB_ERROR_NO_DEVICE;
+				}
 				if (tmp_dev->bus_number != 0) {
 					bus_number = tmp_dev->bus_number;
 					tmp_priv = usbi_get_device_priv(tmp_dev);
@@ -822,8 +1083,7 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 		dev->parent_dev = parent_dev;
 		priv->depth = depth;
 
-		hub_handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-				     0, NULL);
+		hub_handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
 		if (hub_handle == INVALID_HANDLE_VALUE) {
 			usbi_warn(ctx, "could not open hub %s: %s", parent_priv->path, windows_error_str(0));
 			return LIBUSB_ERROR_ACCESS;
@@ -847,6 +1107,12 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 				return LIBUSB_ERROR_NO_DEVICE;
 			}
 
+			if ((conn_info.DeviceDescriptor.bLength != LIBUSB_DT_DEVICE_SIZE)
+				 || (conn_info.DeviceDescriptor.bDescriptorType != LIBUSB_DT_DEVICE)) {
+				SleepEx(50, TRUE);
+				continue;
+			}
+
 			static_assert(sizeof(dev->device_descriptor) == sizeof(conn_info.DeviceDescriptor),
 				      "mismatch between libusb and OS device descriptor sizes");
 			memcpy(&dev->device_descriptor, &conn_info.DeviceDescriptor, LIBUSB_DT_DEVICE_SIZE);
@@ -861,6 +1127,13 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 				SleepEx(50, TRUE);
 			}
 		} while (priv->active_config == 0 && --ginfotimeout >= 0);
+
+		if ((conn_info.DeviceDescriptor.bLength != LIBUSB_DT_DEVICE_SIZE)
+			 || (conn_info.DeviceDescriptor.bDescriptorType != LIBUSB_DT_DEVICE)) {
+			usbi_err(ctx, "device '%s' has invalid descriptor!", priv->dev_id);
+			CloseHandle(hub_handle);
+			return LIBUSB_ERROR_OTHER;
+		}
 
 		if (priv->active_config == 0) {
 			usbi_info(ctx, "0x%x:0x%x found %u configurations but device isn't configured, "
@@ -884,11 +1157,11 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 			if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2,
 				&conn_info_v2, sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, NULL)) {
 				usbi_warn(ctx, "could not get node connection information (V2) for device '%s': %s",
-					  priv->dev_id,  windows_error_str(0));
+					priv->dev_id,  windows_error_str(0));
 			} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher) {
-				conn_info.Speed = 4;
+				conn_info.Speed = UsbSuperSpeedPlus;
 			} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedOrHigher) {
-				conn_info.Speed = 3;
+				conn_info.Speed = UsbSuperSpeed;
 			}
 		}
 
@@ -900,15 +1173,19 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 		dev->device_address = (uint8_t)conn_info.DeviceAddress;
 
 		switch (conn_info.Speed) {
-		case 0: dev->speed = LIBUSB_SPEED_LOW; break;
-		case 1: dev->speed = LIBUSB_SPEED_FULL; break;
-		case 2: dev->speed = LIBUSB_SPEED_HIGH; break;
-		case 3: dev->speed = LIBUSB_SPEED_SUPER; break;
-		case 4: dev->speed = LIBUSB_SPEED_SUPER_PLUS; break;
+		case UsbLowSpeed: dev->speed = LIBUSB_SPEED_LOW; break;
+		case UsbFullSpeed: dev->speed = LIBUSB_SPEED_FULL; break;
+		case UsbHighSpeed: dev->speed = LIBUSB_SPEED_HIGH; break;
+		case UsbSuperSpeed: dev->speed = LIBUSB_SPEED_SUPER; break;
+		case UsbSuperSpeedPlus: dev->speed = LIBUSB_SPEED_SUPER_PLUS; break;
 		default:
 			usbi_warn(ctx, "unknown device speed %u", conn_info.Speed);
 			break;
 		}
+	} else {
+		r = init_root_hub(dev);
+		if (r)
+			return r;
 	}
 
 	r = usbi_sanitize_device(dev);
@@ -946,19 +1223,13 @@ static int enumerate_hcd_root_hub(struct libusb_context *ctx, const char *dev_id
 	if (dev->bus_number == 0) {
 		// Only do this once
 		usbi_dbg("assigning HCD '%s' bus number %u", dev_id, bus_number);
-		priv = usbi_get_device_priv(dev);
 		dev->bus_number = bus_number;
-		dev->device_descriptor.bLength = LIBUSB_DT_DEVICE_SIZE;
-		dev->device_descriptor.bDescriptorType = LIBUSB_DT_DEVICE;
-		dev->device_descriptor.bDeviceClass = LIBUSB_CLASS_HUB;
-		dev->device_descriptor.bNumConfigurations = 1;
-		priv->active_config = 1;
-		priv->root_hub = true;
-		if (sscanf(dev_id, "PCI\\VEN_%04hx&DEV_%04hx%*s", &dev->device_descriptor.idVendor, &dev->device_descriptor.idProduct) != 2) {
+
+		if (sscanf(dev_id, "PCI\\VEN_%04hx&DEV_%04hx%*s", &dev->device_descriptor.idVendor, &dev->device_descriptor.idProduct) != 2)
 			usbi_warn(ctx, "could not infer VID/PID of HCD root hub from '%s'", dev_id);
-			dev->device_descriptor.idVendor = 0x1d6b; // Linux Foundation root hub
-			dev->device_descriptor.idProduct = 1;
-		}
+
+		priv = usbi_get_device_priv(dev);
+		priv->root_hub = true;
 	}
 
 	libusb_unref_device(dev);
@@ -990,7 +1261,7 @@ static void get_api_type(HDEVINFO *dev_info, SP_DEVINFO_DATA *dev_info_data,
 
 			// MULTI_SZ is a pain to work with. Turn it into something much more manageable
 			// NB: none of the driver names we check against contain LIST_SEPARATOR,
-			// (currently ';'), so even if an unsuported one does, it's not an issue
+			// (currently ';'), so even if an unsupported one does, it's not an issue
 			for (l = 0; (lookup[k].list[l] != 0) || (lookup[k].list[l + 1] != 0); l++) {
 				if (lookup[k].list[l] == 0)
 					lookup[k].list[l] = LIST_SEPARATOR;
@@ -1466,9 +1737,10 @@ static int winusb_get_device_list(struct libusb_context *ctx, struct discovered_
 						LOOP_BREAK(LIBUSB_ERROR_NO_MEM);
 
 					*_discdevs = discdevs;
-				} else if (r == LIBUSB_ERROR_NO_DEVICE) {
-					// This can occur if the device was disconnected but Windows hasn't
-					// refreshed its enumeration yet - in that case, we ignore the device
+				} else {
+					// Failed to initialize a single device doesn't stop us from enumerating all other devices,
+					// but we skip it (don't add to list of discovered devices)
+					usbi_warn(ctx, "failed to initialize device '%s'", priv->dev_id);
 					r = LIBUSB_SUCCESS;
 				}
 				break;
@@ -1941,7 +2213,7 @@ static bool winusbx_init(struct libusb_context *ctx)
 {
 	HMODULE hWinUSB, hlibusbK;
 
-	hWinUSB = LoadLibraryA("WinUSB");
+	hWinUSB = load_system_library(ctx, "WinUSB");
 	if (hWinUSB != NULL) {
 		WinUSB_Set(hWinUSB, AbortPipe, true);
 		WinUSB_Set(hWinUSB, ControlTransfer, true);
@@ -1980,7 +2252,7 @@ cleanup_winusb:
 		usbi_info(ctx, "WinUSB DLL is not available");
 	}
 
-	hlibusbK = LoadLibraryA("libusbK");
+	hlibusbK = load_system_library(ctx, "libusbK");
 	if (hlibusbK != NULL) {
 		LibK_GetVersion_t pLibK_GetVersion;
 		LibK_GetProcAddress_t pLibK_GetProcAddress;
@@ -2090,8 +2362,7 @@ static int winusbx_open(int sub_api, struct libusb_device_handle *dev_handle)
 	for (i = 0; i < USB_MAXINTERFACES; i++) {
 		if ((priv->usb_interface[i].path != NULL)
 				&& (priv->usb_interface[i].apib->id == USB_API_WINUSBX)) {
-			file_handle = CreateFileA(priv->usb_interface[i].path, GENERIC_WRITE | GENERIC_READ, FILE_SHARE_WRITE | FILE_SHARE_READ,
-				NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+			file_handle = windows_open(dev_handle->dev, priv->usb_interface[i].path, GENERIC_READ | GENERIC_WRITE);
 			if (file_handle == INVALID_HANDLE_VALUE) {
 				usbi_err(HANDLE_CTX(dev_handle), "could not open device %s (interface %d): %s", priv->usb_interface[i].path, i, windows_error_str(0));
 				switch (GetLastError()) {
@@ -2103,6 +2374,7 @@ static int winusbx_open(int sub_api, struct libusb_device_handle *dev_handle)
 					return LIBUSB_ERROR_IO;
 				}
 			}
+
 			handle_priv->interface_handle[i].dev_handle = file_handle;
 		}
 	}
@@ -2262,8 +2534,7 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 					*dev_interface_path_guid_start = '\0';
 
 					if (strncmp(dev_interface_path, priv->usb_interface[iface].path, strlen(dev_interface_path)) == 0) {
-						file_handle = CreateFileA(filter_path, GENERIC_WRITE | GENERIC_READ, FILE_SHARE_WRITE | FILE_SHARE_READ,
-							NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+						file_handle = windows_open(dev_handle->dev, filter_path, GENERIC_READ | GENERIC_WRITE);
 						if (file_handle != INVALID_HANDLE_VALUE) {
 							if (WinUSBX[sub_api].Initialize(file_handle, &winusb_handle)) {
 								// Replace the existing file handle with the working one
@@ -2457,9 +2728,9 @@ static int winusbx_submit_control_transfer(int sub_api, struct usbi_transfer *it
 			&& (setup->Request == LIBUSB_REQUEST_SET_CONFIGURATION)) {
 		if (setup->Value != priv->active_config) {
 			usbi_warn(TRANSFER_CTX(transfer), "cannot set configuration other than the default one");
-			return LIBUSB_ERROR_INVALID_PARAM;
+			return LIBUSB_ERROR_NOT_SUPPORTED;
 		}
-		windows_force_sync_completion(overlapped, 0);
+		windows_force_sync_completion(itransfer, 0);
 	} else {
 		if (!WinUSBX[sub_api].ControlTransfer(winusb_handle, *setup, transfer->buffer + LIBUSB_CONTROL_SETUP_SIZE, size, NULL, overlapped)) {
 			if (GetLastError() != ERROR_IO_PENDING) {
@@ -2680,7 +2951,7 @@ static int winusbx_submit_iso_transfer(int sub_api, struct usbi_transfer *itrans
 		}
 
 		// Important note: the WinUSB_Read/WriteIsochPipeAsap API requires a ContinueStream parameter that tells whether the isochronous
-		// stream must be continued or if the WinUSB driver can schedule the transfer at its conveniance. Profiling subsequent transfers
+		// stream must be continued or if the WinUSB driver can schedule the transfer at its convenience. Profiling subsequent transfers
 		// with ContinueStream = FALSE showed that 5 frames, i.e. about 5 milliseconds, were left empty between each transfer. This
 		// is critical as this greatly diminish the achievable isochronous bandwidth. We solved the problem using the following strategy:
 		// - Transfers are first scheduled with ContinueStream = TRUE and with winusbx_iso_transfer_continue_stream_callback as user callback.
@@ -3342,9 +3613,7 @@ static int _hid_class_request(struct libusb_device *dev, HANDLE hid_handle, int 
  */
 static bool hid_init(struct libusb_context *ctx)
 {
-	UNUSED(ctx);
-
-	DLL_GET_HANDLE(hid);
+	DLL_GET_HANDLE(ctx, hid);
 
 	DLL_LOAD_FUNC(hid, HidD_GetAttributes, true);
 	DLL_LOAD_FUNC(hid, HidD_GetHidGuid, true);
@@ -3393,15 +3662,14 @@ static int hid_open(int sub_api, struct libusb_device_handle *dev_handle)
 	CHECK_HID_AVAILABLE;
 
 	if (priv->hid == NULL) {
-		usbi_err(HANDLE_CTX(dev_handle), "program assertion failed - private HID structure is unitialized");
+		usbi_err(HANDLE_CTX(dev_handle), "program assertion failed - private HID structure is uninitialized");
 		return LIBUSB_ERROR_NOT_FOUND;
 	}
 
 	for (i = 0; i < USB_MAXINTERFACES; i++) {
 		if ((priv->usb_interface[i].path != NULL)
 				&& (priv->usb_interface[i].apib->id == USB_API_HID)) {
-			hid_handle = CreateFileA(priv->usb_interface[i].path, GENERIC_WRITE | GENERIC_READ, FILE_SHARE_WRITE | FILE_SHARE_READ,
-				NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+			hid_handle = windows_open(dev, priv->usb_interface[i].path, GENERIC_READ | GENERIC_WRITE);
 			/*
 			 * http://www.lvr.com/hidfaq.htm: Why do I receive "Access denied" when attempting to access my HID?
 			 * "Windows 2000 and later have exclusive read/write access to HIDs that are configured as a system
@@ -3411,8 +3679,7 @@ static int hid_open(int sub_api, struct libusb_device_handle *dev_handle)
 			 */
 			if (hid_handle == INVALID_HANDLE_VALUE) {
 				usbi_warn(HANDLE_CTX(dev_handle), "could not open HID device in R/W mode (keyboard or mouse?) - trying without");
-				hid_handle = CreateFileA(priv->usb_interface[i].path, 0, FILE_SHARE_WRITE | FILE_SHARE_READ,
-					NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+				hid_handle = windows_open(dev, priv->usb_interface[i].path, 0);
 				if (hid_handle == INVALID_HANDLE_VALUE) {
 					usbi_err(HANDLE_CTX(dev_handle), "could not open device %s (interface %d): %s", priv->path, i, windows_error_str(0));
 					switch (GetLastError()) {
@@ -3692,7 +3959,7 @@ static int hid_submit_control_transfer(int sub_api, struct usbi_transfer *itrans
 
 	if (r == LIBUSB_COMPLETED) {
 		// Force request to be completed synchronously. Transferred size has been set by previous call
-		windows_force_sync_completion(overlapped, (ULONG)size);
+		windows_force_sync_completion(itransfer, (ULONG)size);
 		r = LIBUSB_SUCCESS;
 	}
 
