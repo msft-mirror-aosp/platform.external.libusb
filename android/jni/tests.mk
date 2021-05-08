@@ -35,6 +35,9 @@ LOCAL_EXPORT_C_INCLUDES := \
 
 LOCAL_MODULE := testlib
 
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-LGPL SPDX-license-identifier-LGPL-2.1 SPDX-license-identifier-LGPL-3.0
+LOCAL_LICENSE_CONDITIONS := restricted
+LOCAL_NOTICE_FILE := $(LOCAL_PATH)/../../COPYING $(LOCAL_PATH)/../../NOTICE
 include $(BUILD_STATIC_LIBRARY)
 
 
@@ -53,4 +56,7 @@ LOCAL_STATIC_LIBRARIES += testlib
 
 LOCAL_MODULE:= stress
 
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-LGPL SPDX-license-identifier-LGPL-2.1 SPDX-license-identifier-LGPL-3.0
+LOCAL_LICENSE_CONDITIONS := restricted
+LOCAL_NOTICE_FILE := $(LOCAL_PATH)/../../COPYING $(LOCAL_PATH)/../../NOTICE
 include $(BUILD_EXECUTABLE)
