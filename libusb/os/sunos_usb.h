@@ -30,6 +30,7 @@
 typedef struct sunos_device_priv {
 	uint8_t	cfgvalue;		/* active config value */
 	uint8_t	*raw_cfgdescr;		/* active config descriptor */
+	struct libusb_device_descriptor	dev_descr;	/* usb device descriptor */
 	char	*ugenpath;		/* name of the ugen(4) node */
 	char	*phypath;		/* physical path */
 } sunos_dev_priv_t;
@@ -63,12 +64,6 @@ struct devlink_cbarg {
 	di_node_t		myself;	/* the di node */
 	di_minor_t		minor;
 };
-
-typedef struct walk_link {
-	char *path;
-	int len;
-	char **linkpp;
-} walk_link_t;
 
 /* AIO callback args */
 struct aio_callback_args{
