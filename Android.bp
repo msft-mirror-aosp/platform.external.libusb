@@ -105,7 +105,15 @@ cc_library {
             ],
         },
 
-        host_linux: {
+        linux_glibc: {
+            local_include_dirs: [
+                "linux",
+            ],
+
+            cflags: ["-Werror"],
+        },
+
+        linux_bionic: {
             local_include_dirs: [
                 "linux",
             ],
