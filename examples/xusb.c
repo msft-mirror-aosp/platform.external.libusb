@@ -37,6 +37,10 @@
 // in libusb_config_descriptor => catter for that
 #define usb_interface interface
 
+#ifndef ARRAYSIZE
+#define ARRAYSIZE(array) (sizeof(array) / sizeof(array[0]))
+#endif
+
 // Global variables
 static bool binary_dump = false;
 static bool extra_info = false;
@@ -461,7 +465,7 @@ static int test_mass_storage(libusb_device_handle *handle, uint8_t endpoint_in, 
 	double device_size;
 	uint8_t cdb[16];	// SCSI Command Descriptor Block
 	uint8_t buffer[64];
-	char vid[9], pid[9], rev[5];
+	unsigned char vid[9], pid[9], rev[5];
 	unsigned char *data;
 	FILE *fd;
 
@@ -560,7 +564,7 @@ static int get_hid_record_size(uint8_t *hid_report_descriptor, int size, int typ
 	uint8_t i, j = 0;
 	uint8_t offset;
 	int record_size[3] = {0, 0, 0};
-	int nb_bits = 0, nb_items = 0;
+	unsigned int nb_bits = 0, nb_items = 0;
 	bool found_record_marker;
 
 	found_record_marker = false;
@@ -575,7 +579,7 @@ static int get_hid_record_size(uint8_t *hid_report_descriptor, int size, int typ
 		case 0x94:	// count
 			nb_items = 0;
 			for (j=1; j<offset; j++) {
-				nb_items = ((uint32_t)hid_report_descriptor[i+j]) << (8*(j-1));
+				nb_items = ((unsigned int)hid_report_descriptor[i+j]) << (8U*(j-1U));
 			}
 			break;
 		case 0x80:	// input
@@ -623,9 +627,9 @@ static int test_hid(libusb_device_handle *handle, uint8_t endpoint_in)
 		printf("   Failed\n");
 		return -1;
 	}
-	display_buffer_hex(hid_report_descriptor, descriptor_size);
+	display_buffer_hex(hid_report_descriptor, (unsigned int)descriptor_size);
 	if ((binary_dump) && ((fd = fopen(binary_name, "w")) != NULL)) {
-		if (fwrite(hid_report_descriptor, 1, descriptor_size, fd) != (size_t)descriptor_size) {
+		if (fwrite(hid_report_descriptor, 1, (size_t)descriptor_size, fd) != (size_t)descriptor_size) {
 			printf("   Error writing descriptor to file\n");
 		}
 		fclose(fd);
@@ -634,8 +638,10 @@ static int test_hid(libusb_device_handle *handle, uint8_t endpoint_in)
 	size = get_hid_record_size(hid_report_descriptor, descriptor_size, HID_REPORT_TYPE_FEATURE);
 	if (size <= 0) {
 		printf("\nSkipping Feature Report readout (None detected)\n");
+	} else if (size > UINT16_MAX) {
+		printf("\nSkipping Feature Report readout (bigger than UINT16_MAX)\n");
 	} else {
-		report_buffer = (uint8_t*) calloc(size, 1);
+		report_buffer = (uint8_t*) calloc(1, (size_t)size);
 		if (report_buffer == NULL) {
 			return -1;
 		}
@@ -644,7 +650,7 @@ static int test_hid(libusb_device_handle *handle, uint8_t endpoint_in)
 		r = libusb_control_transfer(handle, LIBUSB_ENDPOINT_IN|LIBUSB_REQUEST_TYPE_CLASS|LIBUSB_RECIPIENT_INTERFACE,
 			HID_GET_REPORT, (HID_REPORT_TYPE_FEATURE<<8)|0, 0, report_buffer, (uint16_t)size, 5000);
 		if (r >= 0) {
-			display_buffer_hex(report_buffer, size);
+			display_buffer_hex(report_buffer, (unsigned int)size);
 		} else {
 			switch(r) {
 			case LIBUSB_ERROR_NOT_FOUND:
@@ -665,8 +671,10 @@ static int test_hid(libusb_device_handle *handle, uint8_t endpoint_in)
 	size = get_hid_record_size(hid_report_descriptor, descriptor_size, HID_REPORT_TYPE_INPUT);
 	if (size <= 0) {
 		printf("\nSkipping Input Report readout (None detected)\n");
+	} else if (size > UINT16_MAX) {
+		printf("\nSkipping Input Report readout (bigger than UINT16_MAX)\n");
 	} else {
-		report_buffer = (uint8_t*) calloc(size, 1);
+		report_buffer = (uint8_t*) calloc(1, (size_t)size);
 		if (report_buffer == NULL) {
 			return -1;
 		}
@@ -675,7 +683,7 @@ static int test_hid(libusb_device_handle *handle, uint8_t endpoint_in)
 		r = libusb_control_transfer(handle, LIBUSB_ENDPOINT_IN|LIBUSB_REQUEST_TYPE_CLASS|LIBUSB_RECIPIENT_INTERFACE,
 			HID_GET_REPORT, (HID_REPORT_TYPE_INPUT<<8)|0x00, 0, report_buffer, (uint16_t)size, 5000);
 		if (r >= 0) {
-			display_buffer_hex(report_buffer, size);
+			display_buffer_hex(report_buffer, (unsigned int)size);
 		} else {
 			switch(r) {
 			case LIBUSB_ERROR_TIMEOUT:
@@ -695,7 +703,7 @@ static int test_hid(libusb_device_handle *handle, uint8_t endpoint_in)
 		printf("\nTesting interrupt read using endpoint %02X...\n", endpoint_in);
 		r = libusb_interrupt_transfer(handle, endpoint_in, report_buffer, size, &size, 5000);
 		if (r >= 0) {
-			display_buffer_hex(report_buffer, size);
+			display_buffer_hex(report_buffer, (unsigned int)size);
 		} else {
 			printf("   %s\n", libusb_strerror((enum libusb_error)r));
 		}
@@ -753,9 +761,20 @@ static void read_ms_winsub_feature_descriptors(libusb_device_handle *handle, uin
 			perr("   Failed: %s", libusb_strerror((enum libusb_error)r));
 			return;
 		} else {
-			display_buffer_hex(os_desc, r);
+			display_buffer_hex(os_desc, (unsigned int)r);
 		}
 	}
+}
+
+static void print_sublink_speed_attribute(struct libusb_ssplus_sublink_attribute* ss_attr) {
+	static const char exponent[] = " KMG";
+	printf("                  id=%u speed=%u%cbs %s %s SuperSpeed%s",
+		ss_attr->ssid,
+		ss_attr->mantisa,
+		(exponent[ss_attr->exponent]),
+		(ss_attr->type == LIBUSB_SSPLUS_ATTR_TYPE_ASYM)? "Asym" : "Sym",
+		(ss_attr->direction == LIBUSB_SSPLUS_ATTR_DIR_TX)? "TX" : "RX",
+		(ss_attr->protocol == LIBUSB_SSPLUS_ATTR_PROT_SSPLUS)? "+": "" );
 }
 
 static void print_device_cap(struct libusb_bos_dev_capability_descriptor *dev_cap)
@@ -806,6 +825,25 @@ static void print_device_cap(struct libusb_bos_dev_capability_descriptor *dev_ca
 		break;
 
 	}
+	case LIBUSB_BT_SUPERSPEED_PLUS_CAPABILITY: {
+		struct libusb_ssplus_usb_device_capability_descriptor *ssplus_usb_device_cap = NULL;
+		libusb_get_ssplus_usb_device_capability_descriptor(NULL, dev_cap, &ssplus_usb_device_cap);
+		if (ssplus_usb_device_cap) {
+			printf("    USB 3.1 capabilities:\n");
+			printf("      num speed IDs: %d\n", ssplus_usb_device_cap->numSublinkSpeedIDs);
+			printf("      minLaneSpeed: %d\n", ssplus_usb_device_cap->ssid);
+			printf("      minRXLanes: %d\n", ssplus_usb_device_cap->minRxLaneCount);
+			printf("      minTXLanes: %d\n", ssplus_usb_device_cap->minTxLaneCount);
+
+			printf("      num speed attribute IDs: %d\n", ssplus_usb_device_cap->numSublinkSpeedAttributes);
+			for(uint8_t i=0 ; i < ssplus_usb_device_cap->numSublinkSpeedAttributes ; i++) {
+				print_sublink_speed_attribute(&ssplus_usb_device_cap->sublinkSpeedAttributes[i]);
+				printf("\n");
+			}
+			libusb_free_ssplus_usb_device_capability_descriptor(ssplus_usb_device_cap);
+		}
+		break;
+	}
 	default:
 		printf("    Unknown BOS device capability %02x:\n", dev_cap->bDevCapabilityType);
 	}
@@ -822,9 +860,10 @@ static int test_device(uint16_t vid, uint16_t pid)
 	int i, j, k, r;
 	int iface, nb_ifaces, first_iface = -1;
 	struct libusb_device_descriptor dev_desc;
-	const char* const speed_name[6] = { "Unknown", "1.5 Mbit/s (USB LowSpeed)", "12 Mbit/s (USB FullSpeed)",
-		"480 Mbit/s (USB HighSpeed)", "5000 Mbit/s (USB SuperSpeed)", "10000 Mbit/s (USB SuperSpeedPlus)" };
-	char string[128];
+	const char* const speed_name[] = { "Unknown", "1.5 Mbit/s (USB LowSpeed)", "12 Mbit/s (USB FullSpeed)",
+		"480 Mbit/s (USB HighSpeed)", "5000 Mbit/s (USB SuperSpeed)", "10000 Mbit/s (USB SuperSpeedPlus)",
+		"20000 Mbit/s (USB SuperSpeedPlus x2)" };
+	unsigned char string[128];
 	uint8_t string_index[3];	// indexes of the string descriptors
 	uint8_t endpoint_in = 0, endpoint_out = 0;	// default IN and OUT endpoints
 
@@ -850,7 +889,8 @@ static int test_device(uint16_t vid, uint16_t pid)
 			printf(" (from root hub)\n");
 		}
 		r = libusb_get_device_speed(dev);
-		if ((r<0) || (r>5)) r=0;
+		if ((r < 0) || ((size_t)r >= ARRAYSIZE(speed_name)))
+			r = 0;
 		printf("             speed: %s\n", speed_name[r]);
 	}
 
@@ -960,13 +1000,13 @@ static int test_device(uint16_t vid, uint16_t pid)
 		if (string_index[i] == 0) {
 			continue;
 		}
-		if (libusb_get_string_descriptor_ascii(handle, string_index[i], (unsigned char*)string, sizeof(string)) > 0) {
+		if (libusb_get_string_descriptor_ascii(handle, string_index[i], string, sizeof(string)) > 0) {
 			printf("   String (0x%02X): \"%s\"\n", string_index[i], string);
 		}
 	}
 
 	printf("\nReading OS string descriptor:");
-	r = libusb_get_string_descriptor(handle, MS_OS_DESC_STRING_INDEX, 0, (unsigned char*)string, MS_OS_DESC_STRING_LENGTH);
+	r = libusb_get_string_descriptor(handle, MS_OS_DESC_STRING_INDEX, 0, string, MS_OS_DESC_STRING_LENGTH);
 	if (r == MS_OS_DESC_STRING_LENGTH && memcmp(ms_os_desc_string, string, sizeof(ms_os_desc_string)) == 0) {
 		// If this is a Microsoft OS String Descriptor,
 		// attempt to read the WinUSB extended Feature Descriptors
@@ -991,7 +1031,7 @@ static int test_device(uint16_t vid, uint16_t pid)
 			printf("          bFunctionSubClass: %02X\n", iad->bFunctionSubClass);
 			printf("          bFunctionProtocol: %02X\n", iad->bFunctionProtocol);
 			if (iad->iFunction) {
-				if (libusb_get_string_descriptor_ascii(handle, iad->iFunction, (unsigned char*)string, sizeof(string)) > 0)
+				if (libusb_get_string_descriptor_ascii(handle, iad->iFunction, string, sizeof(string)) > 0)
 					printf("                  iFunction: %u (%s)\n", iad->iFunction, string);
 				else
 					printf("                  iFunction: %u (libusb_get_string_descriptor_ascii failed!)\n", iad->iFunction);
@@ -1017,6 +1057,7 @@ static int test_device(uint16_t vid, uint16_t pid)
 		break;
 	case USE_SCSI:
 		CALL_CHECK_CLOSE(test_mass_storage(handle, endpoint_in, endpoint_out), handle);
+		break;
 	case USE_GENERIC:
 		break;
 	}
