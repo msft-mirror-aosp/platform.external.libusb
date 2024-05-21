@@ -62,6 +62,7 @@ cc_library {
         "-Wno-error=switch",
         "-Wno-error=unused-function",
         "-Wno-unused-parameter",
+"-DENABLE_LOGGING=1",
     ],
 
     target: {
