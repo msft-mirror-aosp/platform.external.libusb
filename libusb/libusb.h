@@ -565,7 +565,7 @@ enum libusb_bos_type {
 	/** Platform descriptor */
 	LIBUSB_BT_PLATFORM_DESCRIPTOR = 0x05,
 
-	/* SuperSpeed+ device capability */
+	/* SuperSpeedPlus device capability */
 	LIBUSB_BT_SUPERSPEED_PLUS_CAPABILITY = 0x0A,
 };
 
@@ -1051,7 +1051,7 @@ struct libusb_ssplus_sublink_attribute {
 
 	/** This field defines the mantissa that shall be applied to the exponent when
      calculating the maximum bit rate. */
-	uint16_t mantisa;
+	uint16_t mantissa;
 };
 
 /** \ingroup libusb_desc
