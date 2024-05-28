@@ -182,7 +182,7 @@ static int dev_has_config0(struct libusb_device *dev)
 	return 0;
 }
 
-static int get_usbfs_fd(struct libusb_device *dev, mode_t mode, int silent)
+static int get_usbfs_fd(struct libusb_device *dev, int access_mode, int silent)
 {
 	struct libusb_context *ctx = DEVICE_CTX(dev);
 	char path[24];
@@ -195,7 +195,7 @@ static int get_usbfs_fd(struct libusb_device *dev, mode_t mode, int silent)
 		snprintf(path, sizeof(path), USB_DEVTMPFS_PATH "/%03u/%03u",
 			dev->bus_number, dev->device_address);
 
-	fd = open(path, mode | O_CLOEXEC);
+	fd = open(path, access_mode | O_CLOEXEC);
 	if (fd != -1)
 		return fd; /* Success */
 
@@ -209,14 +209,14 @@ static int get_usbfs_fd(struct libusb_device *dev, mode_t mode, int silent)
 		/* Wait 10ms for USB device path creation.*/
 		nanosleep(&delay_ts, NULL);
 
-		fd = open(path, mode | O_CLOEXEC);
+		fd = open(path, access_mode | O_CLOEXEC);
 		if (fd != -1)
 			return fd; /* Success */
 	}
 
 	if (!silent) {
 		usbi_err(ctx, "libusb couldn't open USB device %s, errno=%d", path, errno);
-		if (errno == EACCES && mode == O_RDWR)
+		if (errno == EACCES && access_mode == O_RDWR)
 			usbi_err(ctx, "libusb requires write access to USB device nodes");
 	}
 
@@ -1628,8 +1628,9 @@ out:
 	return ret;
 }
 
-static int do_streams_ioctl(struct libusb_device_handle *handle, long req,
-	uint32_t num_streams, unsigned char *endpoints, int num_endpoints)
+static int do_streams_ioctl(struct libusb_device_handle *handle,
+	unsigned long req, uint32_t num_streams, unsigned char *endpoints,
+	int num_endpoints)
 {
 	struct linux_device_handle_priv *hpriv = usbi_get_device_handle_priv(handle);
 	int r, fd = hpriv->fd;
