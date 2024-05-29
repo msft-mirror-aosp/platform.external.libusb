@@ -9,12 +9,12 @@ third_party {
   last_upgrade_date {
     year: 2024
     month: 5
-    day: 21
+    day: 28
   }
   homepage: "https://libusb.info/"
   identifier {
     type: "Git"
     value: "https://github.com/libusb/libusb"
-    version: "fef78a96e37936f16c10c43c9a220683f7c2ff74"
+    version: "2a138c6f12988c42eaa9dd663581faa700c44abe"
   }
 }
