@@ -37,8 +37,8 @@ license {
     ],
 }
 
-cc_library {
-    name: "libusb",
+cc_defaults {
+    name: "libusb_defaults",
     host_supported: true,
     vendor_available: true,
 
@@ -49,20 +49,6 @@ cc_library {
         "libusb/io.c",
         "libusb/sync.c",
         "libusb/strerror.c",
-    ],
-
-    local_include_dirs: [
-        "libusb",
-        "libusb/os",
-    ],
-
-    cflags: [
-        "-Wall",
-        "-Wno-error=sign-compare",
-        "-Wno-error=switch",
-        "-Wno-error=unused-function",
-        "-Wno-unused-parameter",
-"-DENABLE_LOGGING=1",
     ],
 
     target: {
@@ -98,7 +84,7 @@ cc_library {
                 "-framework CoreFoundation",
                 "-framework IOKit",
                 "-framework Security",
-                "-lobjc"
+                "-lobjc",
             ],
 
             cflags: [
@@ -138,6 +124,43 @@ cc_library {
         },
     },
 
+    local_include_dirs: [
+        "libusb",
+        "libusb/os",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Wno-error=sign-compare",
+        "-Wno-error=switch",
+        "-Wno-error=unused-function",
+        "-Wno-unused-parameter",
+        "-DENABLE_LOGGING=1",
+    ],
+
     shared_libs: ["liblog"],
     export_include_dirs: ["include"],
+}
+
+cc_library {
+    name: "libusb",
+    defaults: ["libusb_defaults"],
+}
+
+// "libusb_plaform" should be depended upon only by programs running on Android
+// at OS level (e.g. Android platform services). The reason is that programs
+// using "libusb_platform" must have permission to access netlink sockets.
+cc_library {
+    name: "libusb_platform",
+    defaults: ["libusb_defaults"],
+    target: {
+        android: {
+            cflags: [
+                "-Werror",
+                "-DANDROID_OS", // ANDROID_OS flag signals that the program
+                // using libusb runs at Android OS level and allows netlink
+                // event monitoring. See libusb/os/linux_usbfs.h.
+            ],
+        },
+    },
 }
